@@ -1,0 +1,10 @@
+[Telegram]
+token = 
+filter_chat_ids = 
+
+[MySQL]
+host = 
+user = 
+password = 
+db = 
+charset = 
