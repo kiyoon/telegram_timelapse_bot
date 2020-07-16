@@ -9,11 +9,16 @@ from subprocess import PIPE
 
 import json
 
+import time
+import glob
+from utils import *
+
+import threading
+
 logger = logging.getLogger(__name__)
 
 class TimelapseBot:
     def __init__(self, token, filter_chat_ids):
-        self.TABLE_NAME_PREFIX = 'viddb_'      # viddb_{chat_id} format.
         self.updater = Updater(token, use_context=True)
         self.dp = self.updater.dispatcher
         self.filter_chat_ids = filter_chat_ids
@@ -24,8 +29,14 @@ class TimelapseBot:
         self.dp.add_handler(CommandHandler('start', self.start, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('help', self.help, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('timelapse', self.timelapse, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('timelapsedl', self.timelapsedl, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('stop', self.stop, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('status', self.status, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('preview', self.preview, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('video', self.video, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('ifconfig', self.ifconfig, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('du', self.du, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('df', self.df, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CallbackQueryHandler(self.button))
         self.dp.add_handler(MessageHandler(Filters.text & Filters.user(self.filter_chat_ids),
                                                self.message))
@@ -35,17 +46,63 @@ class TimelapseBot:
         self.updater.idle()
 
 
+    def _get_last_downloaded_filename(self):
+        filelist = sorted(glob.glob("capt/*.jpg"))
+        if len(filelist) > 0:
+            last_filename = filelist[-1]
+            return last_filename
+        else:
+            return None
+
+
+    def _get_last_downloaded_num(self):
+        last_filename = self._get_last_downloaded_filename()
+        return int(os.path.basename(last_filename)[:-4]) if last_filename is not None else None
+
+
+    def _kill_gphoto2(self):
+        # kill processes that locks the use of gphoto2
+        subprocess.run(["killall", "/usr/lib/gvfs/gvfs-gphoto2-volume-monitor"])
+        subprocess.run(["killall", "/usr/lib/gvfs/gvfsd-gphoto2"])
+
+
+    def _estimate_size(self, num_photos):
+
+        megabyte_per_photo = range(1, 31, 2)    # 1MiB to 10MiB
+        ret_str = "Estimated total size if one photo is a size of:"
+
+        for mb_per_photo in megabyte_per_photo:
+            size = num_photos * mb_per_photo * 1024 * 1024
+            str_size = sizeof_fmt(size)
+
+            ret_str += "\n{:d} MiB -> {:s}".format(mb_per_photo, str_size)
+
+        return ret_str
+
 
 
     def _is_proc_running(self):
         if self.proc is not None:
-            if self.proc.returncode is None:
+        #    if self.proc.returncode is None:
+            if self.proc.poll() is None:
                 return True
         return False
 
 
+    def _wait_for_process(self, func_after, update, context):
+        while self.proc.poll() is None:
+            time.sleep(1)
+
+        func_after(update, context)
+
+    def _send_video(self, update, context):
+        update.message.reply_text("Encoding finished. Sending..")
+        context.bot.send_video(chat_id=update.effective_chat.id, video=open("capt/video.mp4", 'rb'))
+        
+
     def start(self, update, context):
         self.help(update, context)
+
 
     def help(self, update, context):
         #context.bot.send_message(chat_id=update.message.chat_id, text="")
@@ -54,12 +111,24 @@ class TimelapseBot:
                                       "Available commands:\n\n"
                                       "/help\n"
                                       "Show this help\n\n"
-                                      "/timelapse\n"
-                                      "\n\n"
+                                      "/timelapse INTERVAL COUNT\n"
+                                      "Capture without downloading.\n\n"
+                                      "/timelapsedl INTERVAL COUNT\n"
+                                      "Capture and download.\n\n"
                                       "/stop\n"
-                                      "Stop the timelapse process\n\n"
+                                      "stop the timelapse process\n\n"
+                                      "/status\n"
+                                      "Show the status.\n\n"
+                                      "/preview\n"
+                                      "Preview the last image captured (only with /timelapsedl).\n\n"
                                       "/ifconfig\n"
                                       "Return ifconfig output\n\n")
+                                      "/du\n"
+                                      "Check captured file size\n\n"
+                                      "/df\n"
+                                      "Check system storage\n\n"
+
+
 
 
     def timelapse(self, update, context):
@@ -67,17 +136,59 @@ class TimelapseBot:
             update.message.reply_text("You need 2 arguments")
             return
 
-        interval = args[0]
-        num_photos = args[1]
+        if self._is_proc_running():
+            update.message.reply_text("Time lapse already running. Try to stop the process first.")
+            return
+
+        self._kill_gphoto2()
+
+        interval = context.args[0]
+        num_photos = context.args[1]
+
+        self.interval = float(interval)
+        self.num_photos = int(num_photos)
+        self.command = "timelapse"
+        self.expected_time = self.interval * self.num_photos
+
+        update.message.reply_text("Expected time: {:s}\nTimelapse video of {:s} at 23.976 fps.\n{:s}".format(time_fmt(self.expected_time), time_fmt(self.num_photos / 23.976), self._estimate_size(self.num_photos)))
 
         # execute, and then not wait.
         self.proc = subprocess.Popen(
                 ["gphoto2", "--set-config", "capturetarget=1", "-I", interval, "-F", num_photos, "--capture-image"],
                 shell=False, stdin=None, stdout=None, stderr=None)
+        self.proc_start_time = time.time()
+        
 
+
+    def timelapsedl(self, update, context):
+        if len(context.args) != 2:
+            update.message.reply_text("You need 2 arguments")
+            return
+
+        if self._is_proc_running():
+            update.message.reply_text("Time lapse already running. Try to stop the process first.")
+            return
+
+        self._kill_gphoto2()
+
+        interval = context.args[0]
+        num_photos = context.args[1]
+
+        self.interval = float(interval)
+        self.num_photos = int(num_photos)
+        self.command = "timelapsedl"
+        self.expected_time = self.interval * self.num_photos
+
+        update.message.reply_text("Expected time: {:s}\nTimelapse video of {:s} at 23.976 fps.\n{:s}".format(time_fmt(self.expected_time), time_fmt(self.num_photos / 23.976), self._estimate_size(self.num_photos)))
+
+        # execute, and then not wait.
+        self.proc = subprocess.Popen(
+                ["gphoto2", "--set-config", "capturetarget=1", "-I", interval, "-F", num_photos, "--capture-image-and-download", "--keep", "--keep-raw", "--filename", "capt/%07n.jpg"],
+                shell=False, stdin=None, stdout=None, stderr=None)
+        self.proc_start_time = time.time()
 
     def stop(self, update, context):
-        if self._is_proc_running:
+        if self._is_proc_running():
             #os.kill(self.proc.pid, signal.SIGINT)
             #proc.send_signal(signal.SIGINT)
             #proc.kill()
@@ -86,12 +197,77 @@ class TimelapseBot:
         else:
             update.message.reply_text("No process running")
 
+    def status(self, update, context):
+        if self._is_proc_running():
+            if self.command.startswith("timelapse"):
+                #update.message.reply_text(self.proc.stdout.read().decode('utf-8'))
+                elapsed_time = time.time() - self.proc_start_time
+                message = "Expected time: {:s}\n".format(time_fmt(self.expected_time))
+                message += "Elapsed time: {:s}\n".format(time_fmt(elapsed_time))
+                message += "{:2.1f}%".format(elapsed_time / self.expected_time * 100.0)
+
+                if self.command == "timelapsedl":
+                    num_taken = self._get_last_downloaded_num()
+                    num_left = self.num_photos - num_taken
+                    message += "\n\n"
+                    message += "Total # of photos: {:d}\n".format(self.num_photos)
+                    message += "# taken: {:d}\n".format(num_taken)
+                    message += "# left: {:d}\n".format(num_left)
+                    message += "{:2.1f}%\n".format(num_taken / self.num_photos * 100.0)
+                    message += "ETA: {:s}".format(time_fmt(num_left * self.interval))
+
+                update.message.reply_text(message)
+
+            else:
+                update.message.reply_text("Time lapse not running.")
+
+        else:
+            update.message.reply_text("No process running")
+
+
+    def preview(self, update, context):
+        last_filename = self._get_last_downloaded_filename()
+        if last_filename is None:
+            update.message.reply_text("No file to preview")
+            return
+
+        update.message.reply_text(last_filename)
+        context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(last_filename, 'rb'))
+
+    def video(self, update, context):
+        if self._is_proc_running():
+            update.message.reply_text("Process already running. Wait or stop the process.")
+            return
+
+        update.message.reply_text("Encoding video..")
+        self.command = "video"
+        self.proc = subprocess.Popen(
+                ["ffmpeg", "-i", "capt/%07d.jpg", "-vf", "scale=-2:400", "-sws_flags", "bicubic", "-c:v", "libx264", "-preset", "fast", "-crf", "25",
+                    "-color_range", "pc", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709", "-pix_fmt", "yuvj420p",
+                    "-an", "-r", "24000/1001", "capt/video.mp4"],
+                shell=False)
+
+        x = threading.Thread(target=self._wait_for_process, args=(self._send_video,update,context))
+        x.start()
+        #self._wait_for_process(self._send_video, update, context)
+
     def ifconfig(self, update, context):
         proc = subprocess.Popen(
                 ["ifconfig", "-a"],
                 shell=False, stdout=PIPE)
-        update.message.reply_text(proc.stdout.read().decode('utf-8'))
+        update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
 
+    def du(self, update, context):
+        proc = subprocess.Popen(
+                ["du", "-h", "capt"],
+                shell=False, stdout=PIPE)
+        update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
+
+    def df(self, update, context):
+        proc = subprocess.Popen(
+                ["df", "-h"],
+                shell=False, stdout=PIPE)
+        update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
 
     def button(self, update, context):
         query = update.callback_query
@@ -139,9 +315,27 @@ class TimelapseBot:
         traceback.print_exc(context.error)
 
 if __name__ == "__main__":
+    __location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
+
     coloredlogs.install(fmt='%(asctime)s - %(name)s: %(lineno)4d - %(levelname)s - %(message)s', level='DEBUG')
 
-    __location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
+    f_handler = logging.FileHandler(os.path.join(__location__, 'timelapse.log'))
+    #f_handler.setLevel(logging.NOTSET)
+    f_handler.setLevel(logging.DEBUG)
+
+    # Create formatters and add it to handlers
+    f_format = logging.Formatter('%(asctime)s - %(name)s: %(lineno)4d - %(levelname)s - %(message)s')
+    f_handler.setFormatter(f_format)
+
+    # Add handlers to the logger
+    root_logger = logging.getLogger()
+    root_logger.addHandler(f_handler)
+
+    while not is_internet():
+        logger.debug("Checking internet connection to 8.8.8.8 failed.. Repeating")
+        time.sleep(1)
+
+
     config = ConfigParser()
     config.read(os.path.join(__location__, "key.ini"))
     token = config['Telegram']['token']
