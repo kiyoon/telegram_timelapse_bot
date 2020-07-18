@@ -14,6 +14,9 @@ import glob
 from utils import *
 
 import threading
+import definitions
+import filepath
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +35,11 @@ class TimelapseBot:
         self.dp.add_handler(CommandHandler('timelapsedl', self.timelapsedl, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('stop', self.stop, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('status', self.status, filters=Filters.user(self.filter_chat_ids)))
-        self.dp.add_handler(CommandHandler('preview', self.preview, filters=Filters.user(self.filter_chat_ids)))
-        self.dp.add_handler(CommandHandler('video', self.video, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('preview', self.preview, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('video', self.video, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('list', self.list, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('rmdir', self.rmdir, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
+        self.dp.add_handler(CommandHandler('rmvid', self.rmvid, pass_args = True, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('ifconfig', self.ifconfig, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('du', self.du, filters=Filters.user(self.filter_chat_ids)))
         self.dp.add_handler(CommandHandler('df', self.df, filters=Filters.user(self.filter_chat_ids)))
@@ -45,19 +51,6 @@ class TimelapseBot:
         logger.info('Listening...')
         self.updater.idle()
 
-
-    def _get_last_downloaded_filename(self):
-        filelist = sorted(glob.glob("capt/*.jpg"))
-        if len(filelist) > 0:
-            last_filename = filelist[-1]
-            return last_filename
-        else:
-            return None
-
-
-    def _get_last_downloaded_num(self):
-        last_filename = self._get_last_downloaded_filename()
-        return int(os.path.basename(last_filename)[:-4]) if last_filename is not None else None
 
 
     def _kill_gphoto2(self):
@@ -96,9 +89,26 @@ class TimelapseBot:
         func_after(update, context)
 
     def _send_video(self, update, context):
+        if len(context.args) < 1:
+            index = filepath.get_last_index()
+            if index < 0:
+                update.message.reply_text("No file to preview")
+                return
+        else:
+            try:
+                index = int(context.args[0])
+            except ValueError as e:
+                update.message.reply_text("Index must be an integer")
+                return
+
+
         update.message.reply_text("Encoding finished. Sending..")
-        context.bot.send_video(chat_id=update.effective_chat.id, video=open("capt/video.mp4", 'rb'))
+        context.bot.send_video(chat_id=update.effective_chat.id, video=open(filepath.get_video_path(index), 'rb'))
         
+
+    def _end_of_timelapse(self, update, context):
+        update.message.reply_text("Time lapse finished in {:s}.".format(time_fmt(time.time() - self.proc_start_time)))
+
 
     def start(self, update, context):
         self.help(update, context)
@@ -119,14 +129,22 @@ class TimelapseBot:
                                       "stop the timelapse process\n\n"
                                       "/status\n"
                                       "Show the status.\n\n"
-                                      "/preview\n"
+                                      "/preview INDEX=-1\n"
                                       "Preview the last image captured (only with /timelapsedl).\n\n"
+                                      "/video INDEX=-1\n"
+                                      "Return the time lapse video (only with /timelapsedl).\n\n"
+                                      "/list\n"
+                                      "List the time lapse dir\n\n"
+                                      "/rmdir INDEX\n"
+                                      "FORCE remove the directory of the index.\n\n"
+                                      "/rmvid INDEX\n"
+                                      "FORCE remove the video.mp4 in the directory of the index.\n\n"
                                       "/ifconfig\n"
-                                      "Return ifconfig output\n\n")
+                                      "Return ifconfig output\n\n"
                                       "/du\n"
                                       "Check captured file size\n\n"
                                       "/df\n"
-                                      "Check system storage\n\n"
+                                      "Check system storage\n\n")
 
 
 
@@ -145,12 +163,17 @@ class TimelapseBot:
         interval = context.args[0]
         num_photos = context.args[1]
 
-        self.interval = float(interval)
-        self.num_photos = int(num_photos)
+        try:
+            self.interval = float(interval)
+            self.num_photos = int(num_photos)
+        except ValueError as e:
+            update.message.reply_text("Only numbers are accepted")
+            return
+
         self.command = "timelapse"
         self.expected_time = self.interval * self.num_photos
 
-        update.message.reply_text("Expected time: {:s}\nTimelapse video of {:s} at 23.976 fps.\n{:s}".format(time_fmt(self.expected_time), time_fmt(self.num_photos / 23.976), self._estimate_size(self.num_photos)))
+        update.message.reply_text("Expected time: {:s}\nTimelapse video of {:s} at {:.2f} fps.\n{:s}".format(time_fmt(self.expected_time), time_fmt(self.num_photos / definitions.fps), definitions.fps, self._estimate_size(self.num_photos)))
 
         # execute, and then not wait.
         self.proc = subprocess.Popen(
@@ -158,6 +181,8 @@ class TimelapseBot:
                 shell=False, stdin=None, stdout=None, stderr=None)
         self.proc_start_time = time.time()
         
+        x = threading.Thread(target=self._wait_for_process, args=(self._end_of_timelapse,update,context))
+        x.start()
 
 
     def timelapsedl(self, update, context):
@@ -174,18 +199,31 @@ class TimelapseBot:
         interval = context.args[0]
         num_photos = context.args[1]
 
-        self.interval = float(interval)
-        self.num_photos = int(num_photos)
+        try:
+            self.interval = float(interval)
+            self.num_photos = int(num_photos)
+        except ValueError as e:
+            update.message.reply_text("Only numbers are accepted")
+            return
+
         self.command = "timelapsedl"
         self.expected_time = self.interval * self.num_photos
+        self.video_index = filepath.get_last_index() + 1
 
-        update.message.reply_text("Expected time: {:s}\nTimelapse video of {:s} at 23.976 fps.\n{:s}".format(time_fmt(self.expected_time), time_fmt(self.num_photos / 23.976), self._estimate_size(self.num_photos)))
+        dest_dir = filepath.get_subdir(self.video_index)
+
+        update.message.reply_text("Downloading in {:s}\nExpected time: {:s}\nTimelapse video of {:s} at {:.2f} fps.\n{:s}".format(dest_dir, time_fmt(self.expected_time), time_fmt(self.num_photos / definitions.fps), definitions.fps, self._estimate_size(self.num_photos)))
 
         # execute, and then not wait.
+        dest_files = os.path.join(dest_dir, filepath.capture_filename_gphoto2)
         self.proc = subprocess.Popen(
-                ["gphoto2", "--set-config", "capturetarget=1", "-I", interval, "-F", num_photos, "--capture-image-and-download", "--keep", "--keep-raw", "--filename", "capt/%07n.jpg"],
+                ["gphoto2", "--set-config", "capturetarget=1", "-I", interval, "-F", num_photos, "--capture-image-and-download", "--keep", "--keep-raw", "--filename", dest_files],
                 shell=False, stdin=None, stdout=None, stderr=None)
         self.proc_start_time = time.time()
+
+        x = threading.Thread(target=self._wait_for_process, args=(self._end_of_timelapse,update,context))
+        x.start()
+
 
     def stop(self, update, context):
         if self._is_proc_running():
@@ -197,6 +235,7 @@ class TimelapseBot:
         else:
             update.message.reply_text("No process running")
 
+
     def status(self, update, context):
         if self._is_proc_running():
             if self.command.startswith("timelapse"):
@@ -207,7 +246,7 @@ class TimelapseBot:
                 message += "{:2.1f}%".format(elapsed_time / self.expected_time * 100.0)
 
                 if self.command == "timelapsedl":
-                    num_taken = self._get_last_downloaded_num()
+                    num_taken = filepath.get_last_downloaded_num()
                     num_left = self.num_photos - num_taken
                     message += "\n\n"
                     message += "Total # of photos: {:d}\n".format(self.num_photos)
@@ -226,7 +265,19 @@ class TimelapseBot:
 
 
     def preview(self, update, context):
-        last_filename = self._get_last_downloaded_filename()
+        if len(context.args) < 1:
+            index = filepath.get_last_index()
+            if index < 0:
+                update.message.reply_text("No file to preview.")
+                return
+        else:
+            try:
+                index = int(context.args[0])
+            except ValueError as e:
+                update.message.reply_text("Index must be an integer")
+                return
+
+        last_filename = filepath.get_last_downloaded_filename(index)
         if last_filename is None:
             update.message.reply_text("No file to preview")
             return
@@ -239,17 +290,96 @@ class TimelapseBot:
             update.message.reply_text("Process already running. Wait or stop the process.")
             return
 
+        if len(context.args) < 1:
+            index = filepath.get_last_index()
+            if index < 0:
+                update.message.reply_text("No file to preview")
+                return
+        else:
+            try:
+                index = int(context.args[0])
+            except ValueError as e:
+                update.message.reply_text("Index must be an integer")
+                return
+
+        dest_video_path = filepath.get_video_path(index)
+        if os.path.exists(dest_video_path):
+            update.message.reply_text("Video already exist.")
+            return
+
+        if not filepath.index_exists(index):
+            update.message.reply_text("Such index doesn't exist.")
+            return
+
         update.message.reply_text("Encoding video..")
         self.command = "video"
         self.proc = subprocess.Popen(
-                ["ffmpeg", "-i", "capt/%07d.jpg", "-vf", "scale=-2:400", "-sws_flags", "bicubic", "-c:v", "libx264", "-preset", "fast", "-crf", "25",
+                ["ffmpeg", "-i", os.path.join(filepath.get_subdir(index), filepath.capture_filename_ffmpeg), "-vf", "scale=-2:400", "-sws_flags", "bicubic", "-c:v", "libx264", "-preset", "fast", "-crf", "25",
                     "-color_range", "pc", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709", "-pix_fmt", "yuvj420p",
-                    "-an", "-r", "24000/1001", "capt/video.mp4"],
+                    "-an", "-r", definitions.fps_str, dest_video_path],
                 shell=False)
 
         x = threading.Thread(target=self._wait_for_process, args=(self._send_video,update,context))
         x.start()
         #self._wait_for_process(self._send_video, update, context)
+
+
+    def list(self, update, context):
+        ret_str = ""
+        subdirs = filepath.list_subdirs()
+        if len(subdirs) > 0:
+            for subdirname in subdirs:
+                jpgs = glob.glob(os.path.join(filepath.capture_dirpath, subdirname, "*.jpg"))
+                ret_str += "{:s}\t{:d} jpgs\n".format(subdirname, len(jpgs))
+                
+            update.message.reply_text(ret_str)
+
+        else:
+            update.message.reply_text("No files to list")
+
+
+    def rmdir(self, update, context):
+        if len(context.args) < 1:
+            update.message.reply_text("You must specify the index of the directory to remove.")
+            return
+        else:
+            try:
+                index = int(context.args[0])
+            except ValueError as e:
+                update.message.reply_text("Index must be an integer")
+                return
+        
+        dir_to_remove = filepath.get_subdir(index)
+        try:
+            shutil.rmtree(dir_to_remove)
+        except:
+            update.message.reply_text("Error deleting {:s}".format(dir_to_remove))
+            return
+        
+        update.message.reply_text("Successfully deleted {:s}".format(dir_to_remove))
+
+
+    def rmvid(self, update, context):
+        if len(context.args) < 1:
+            update.message.reply_text("You must specify the index of the directory to remove.")
+            return
+        else:
+            try:
+                index = int(context.args[0])
+            except ValueError as e:
+                update.message.reply_text("Index must be an integer")
+                return
+        
+        video_to_remove = filepath.get_video_path(index)
+        try:
+            os.remove(video_to_remove)
+        except:
+            update.message.reply_text("Error deleting {:s}".format(video_to_remove))
+            return
+        
+        update.message.reply_text("Successfully deleted {:s}".format(video_to_remove))
+
+
 
     def ifconfig(self, update, context):
         proc = subprocess.Popen(
@@ -259,7 +389,7 @@ class TimelapseBot:
 
     def du(self, update, context):
         proc = subprocess.Popen(
-                ["du", "-h", "capt"],
+                ["du", "-h", filepath.capture_dirpath],
                 shell=False, stdout=PIPE)
         update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
 
