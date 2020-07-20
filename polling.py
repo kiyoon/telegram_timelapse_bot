@@ -390,10 +390,13 @@ class TimelapseBot:
         update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
 
     def du(self, update, context):
-        proc = subprocess.Popen(
-                ["du", "-h", filepath.capture_dirpath],
-                shell=False, stdout=PIPE)
-        update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
+        if os.path.isdir(filepath.capture_dirpath):
+            proc = subprocess.Popen(
+                    ["du", "-h", filepath.capture_dirpath],
+                    shell=False, stdout=PIPE)
+            update.message.reply_text("```\n" + proc.stdout.read().decode('utf-8') + "\n```", parse_mode = "markdown")
+        else:
+            update.message.reply_text("Nothing captured using /timelapsedl")
 
     def df(self, update, context):
         proc = subprocess.Popen(
