@@ -316,7 +316,7 @@ class TimelapseBot:
         update.message.reply_text("Encoding video..")
         self.command = "video"
         self.proc = subprocess.Popen(
-                ["ffmpeg", "-i", os.path.join(filepath.get_subdir(index), filepath.capture_filename_ffmpeg), "-vf", "scale=-2:400", "-sws_flags", "bicubic", "-c:v", "libx264", "-preset", "fast", "-crf", "25",
+                ["ffmpeg", "-i", os.path.join(filepath.get_subdir(index), filepath.capture_filename_ffmpeg), "-vf", "scale=-2:{:d}".format(definitions.encoded_video_height), "-sws_flags", "bicubic", "-c:v", "libx264", "-preset", "fast", "-crf", "25",
                     "-color_range", "pc", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709", "-pix_fmt", "yuvj420p",
                     "-an", "-r", definitions.fps_str, dest_video_path],
                 shell=False)
