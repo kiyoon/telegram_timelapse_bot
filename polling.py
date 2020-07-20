@@ -14,9 +14,11 @@ import glob
 from utils import *
 
 import threading
+import shutil
+
+
 import definitions
 import filepath
-import shutil
 
 logger = logging.getLogger(__name__)
 
