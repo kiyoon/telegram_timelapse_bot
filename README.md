@@ -37,6 +37,10 @@ Control time lapse using Telegram.
 
 ```bash
 sudo pip3 install -r requirements.txt
+sudo apt update
+sudo apt install gphoto2
+
+# optional: ffmpeg
 ```
 
 Make the programme start on boot. Edit /etc/rc.local and add `sudo python3 /path/to/telegram_timelapse_bot/polling.py &` before the last line `exit 0`.
