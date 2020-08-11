@@ -43,4 +43,6 @@ sudo apt install gphoto2
 # optional: ffmpeg
 ```
 
+Make `key.ini` and put your Telegram bot token and chat ID. See `key.ini.template`.  
+
 Make the programme start on boot. Edit /etc/rc.local and add `sudo python3 /path/to/telegram_timelapse_bot/polling.py &` before the last line `exit 0`.
